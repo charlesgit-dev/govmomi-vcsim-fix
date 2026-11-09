@@ -91,6 +91,19 @@ func (c *ClusterComputeResource) vsanIsEnabled() bool {
 	return false
 }
 
+// syncConfiguration populates the (deprecated) ClusterComputeResource.configuration property
+// from configurationEx, as vCenter does. ClusterConfigInfoEx extends ClusterConfigInfo, so the
+// shared fields are copied.
+func (c *ClusterComputeResource) syncConfiguration(cfg *types.ClusterConfigInfoEx) {
+	c.Configuration = types.ClusterConfigInfo{
+		DasConfig:   cfg.DasConfig,
+		DasVmConfig: cfg.DasVmConfig,
+		DrsConfig:   cfg.DrsConfig,
+		DrsVmConfig: cfg.DrsVmConfig,
+		Rule:        cfg.Rule,
+	}
+}
+
 func (c *ClusterComputeResource) update(_ *Context, cfg *types.ClusterConfigInfoEx, cspec *types.ClusterConfigSpecEx) types.BaseMethodFault {
 	if cspec.DasConfig != nil {
 		if val := cspec.DasConfig.Enabled; val != nil {
@@ -406,6 +419,8 @@ func (c *ClusterComputeResource) ReconfigureComputeResourceTask(ctx *Context, re
 			}
 		}
 
+		c.syncConfiguration(c.ConfigurationEx.(*types.ClusterConfigInfoEx))
+
 		return nil, nil
 	})
 
@@ -694,6 +709,16 @@ func CreateClusterComputeResource(ctx *Context, f *Folder, name string, spec typ
 
 	config.VmSwapPlacement = string(types.VirtualMachineConfigInfoSwapPlacementTypeVmDirectory)
 	config.DrsConfig.Enabled = types.NewBool(true)
+	// vSphere HA is not implemented by the simulator, so report it as explicitly disabled.
+	// ClusterDasConfigInfo.enabled and .admissionControlEnabled are optional (*bool) and are
+	// omitted from the SOAP response when nil, which clients such as Turbonomic cannot
+	// distinguish from "unknown" and fail on when unboxing.
+	config.DasConfig.Enabled = types.NewBool(false)
+	config.DasConfig.AdmissionControlEnabled = types.NewBool(false)
+	config.DasConfig.HostMonitoring = string(types.ClusterDasConfigInfoServiceStateEnabled)
+	config.DasConfig.VmMonitoring = string(types.ClusterDasConfigInfoVmMonitoringStateVmMonitoringDisabled)
+
+	cluster.syncConfiguration(config)
 
 	pool := NewResourcePool(ctx)
 	ctx.Map.PutEntity(cluster, ctx.Map.NewEntity(pool))

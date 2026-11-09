@@ -15,9 +15,11 @@ import (
 	"github.com/vmware/govmomi"
 	"github.com/vmware/govmomi/find"
 	"github.com/vmware/govmomi/object"
+	"github.com/vmware/govmomi/property"
 	"github.com/vmware/govmomi/simulator/esx"
 	"github.com/vmware/govmomi/simulator/vpx"
 	"github.com/vmware/govmomi/vim25"
+	"github.com/vmware/govmomi/vim25/mo"
 	"github.com/vmware/govmomi/vim25/types"
 )
 
@@ -405,4 +407,98 @@ func TestPlaceVmCreateDatastores(t *testing.T) {
 		})
 		require.NoError(t, err)
 	}, model)
+}
+
+// TestClusterDasConfigDefaults asserts that model-created clusters report an explicit
+// HA (DAS) enabled value through the PropertyCollector, rather than an omitted element.
+// Clients such as Turbonomic unbox ClusterDasConfigInfo.Enabled and fail if it is absent.
+func TestClusterDasConfigDefaults(t *testing.T) {
+	m := VPX()
+	m.Datacenter = 1
+	m.Cluster = 2
+	m.ClusterHost = 2
+	m.Pool = 2
+	m.Machine = 5
+
+	Test(func(ctx context.Context, c *vim25.Client) {
+		finder := find.NewFinder(c, false)
+		dc, err := finder.DefaultDatacenter(ctx)
+		require.NoError(t, err)
+		finder.SetDatacenter(dc)
+
+		clusters, err := finder.ClusterComputeResourceList(ctx, "*")
+		require.NoError(t, err)
+		require.Len(t, clusters, m.Cluster)
+
+		pc := property.DefaultCollector(c)
+
+		for _, cluster := range clusters {
+			// configurationEx, via the object helper.
+			cfg, err := cluster.Configuration(ctx)
+			require.NoError(t, err)
+			require.NotNil(t, cfg.DasConfig.Enabled, "%s: dasConfig.enabled is nil", cluster.Name())
+			require.False(t, *cfg.DasConfig.Enabled, "HA is not implemented, must default to disabled")
+			require.NotNil(t, cfg.DasConfig.AdmissionControlEnabled)
+			require.False(t, *cfg.DasConfig.AdmissionControlEnabled)
+			require.NotNil(t, cfg.DrsConfig.Enabled)
+
+			// configuration (deprecated ClusterConfigInfo), via the PropertyCollector directly.
+			var mc mo.ClusterComputeResource
+			err = pc.RetrieveOne(ctx, cluster.Reference(), []string{"configuration", "configurationEx"}, &mc)
+			require.NoError(t, err)
+			require.NotNil(t, mc.Configuration.DasConfig.Enabled, "configuration.dasConfig.enabled is nil")
+			require.False(t, *mc.Configuration.DasConfig.Enabled)
+			require.NotNil(t, mc.Configuration.DasConfig.AdmissionControlEnabled)
+			require.NotNil(t, mc.Configuration.DrsConfig.Enabled)
+
+			// configuration and configurationEx must agree.
+			ex := mc.ConfigurationEx.(*types.ClusterConfigInfoEx)
+			require.Equal(t, ex.DasConfig.Enabled, mc.Configuration.DasConfig.Enabled)
+			require.Equal(t, ex.DrsConfig.Enabled, mc.Configuration.DrsConfig.Enabled)
+
+			// Cluster still contains hosts, pools and VMs.
+			var cr mo.ClusterComputeResource
+			err = pc.RetrieveOne(ctx, cluster.Reference(), []string{"host", "resourcePool", "summary"}, &cr)
+			require.NoError(t, err)
+			require.Len(t, cr.Host, m.ClusterHost)
+			require.NotNil(t, cr.ResourcePool)
+
+			pool := object.NewResourcePool(c, *cr.ResourcePool)
+			var rp mo.ResourcePool
+			require.NoError(t, pc.RetrieveOne(ctx, pool.Reference(), []string{"resourcePool", "vm"}, &rp))
+			require.Len(t, rp.ResourcePool, m.Pool)
+
+			vms := 0
+			for _, ref := range rp.ResourcePool {
+				var child mo.ResourcePool
+				require.NoError(t, pc.RetrieveOne(ctx, ref, []string{"vm"}, &child))
+				vms += len(child.Vm)
+			}
+			require.Equal(t, m.Pool*m.Machine, vms)
+		}
+	}, m)
+}
+
+// TestClusterDasConfigReconfigure asserts that ReconfigureComputeResource keeps the
+// deprecated "configuration" property in sync with "configurationEx".
+func TestClusterDasConfigReconfigure(t *testing.T) {
+	Test(func(ctx context.Context, c *vim25.Client) {
+		cluster := object.NewClusterComputeResource(c, Map(ctx).Any("ClusterComputeResource").Reference())
+		pc := property.DefaultCollector(c)
+
+		for _, enabled := range []bool{true, false} {
+			task, err := cluster.Reconfigure(ctx, &types.ClusterConfigSpecEx{
+				DasConfig: &types.ClusterDasConfigInfo{Enabled: types.NewBool(enabled)},
+			}, true)
+			require.NoError(t, err)
+			require.NoError(t, task.Wait(ctx))
+
+			var mc mo.ClusterComputeResource
+			err = pc.RetrieveOne(ctx, cluster.Reference(), []string{"configuration", "configurationEx"}, &mc)
+			require.NoError(t, err)
+			require.NotNil(t, mc.Configuration.DasConfig.Enabled)
+			require.Equal(t, enabled, *mc.Configuration.DasConfig.Enabled)
+			require.Equal(t, enabled, *mc.ConfigurationEx.(*types.ClusterConfigInfoEx).DasConfig.Enabled)
+		}
+	}, VPX())
 }
